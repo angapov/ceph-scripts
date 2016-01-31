@@ -1,0 +1,1 @@
+../OpenStack/scripts/ceph-tools/prepare_osd.sh
