@@ -80,6 +80,7 @@ def looks_like_uuid(string):
     re_id = re.compile("[a-z0-9]+", re.I)
     like_uuid = len(string)==36 and bool(re_uuid.match(str(string)))
     like_id = len(string)==32 and bool(re_id.match(str(string)))
+    LOG.info("%s looks like uuid: %s" % (string, like_uuid or like_id) )
     return True if like_uuid or like_id else False
 
 def get_keystone_session():
@@ -146,13 +147,9 @@ def rename_rbd(rbd_name, new_name):
 
 def freeze_vm(dom):
     ret = dom.fsFreeze()
-    if ret!=1:
-        LOG.error("Failed to freeze VM: %s" % ret)
 
 def thaw_vm(dom):
     ret = dom.fsThaw()
-    if ret!=1:
-        LOG.error("Failed to thaw VM: %s" % ret)
 
 def rbd_snap_create(rbd_name, snap_name):
     ioctx = get_pool_ioctx(rbd_name)
@@ -253,11 +250,10 @@ def snapshots_list(rbd_image):
                         key=lambda f: strptime(f['name'], TIME_FORMAT)) ]
     sorted_by_id   = [ snap['name'] for snap in sorted(list(rbd_image.list_snaps()), \
                 key=lambda f: int(f['id']))]
-    if sorted_by_time == sorted_by_id:
-        return sorted_by_time
-    else:
+    if sorted_by_time != sorted_by_id:
         LOG.warning("Snapshots list of %s is not ordered correctly, please check!" 
                 % rbd_image.name)
+    return sorted_by_time
 
 def remove_all_snapshots(rbd_list):
     for rbd_image in rbd_list:
@@ -315,6 +311,7 @@ def export_diff(instance, rbd_list, full_backup=False):
                     for dir in dirs:
                         if dir < snap:
                             shutil.rmtree(os.path.join(root, dir))
+            map(rbd_image.remove_snap, snaps_list[:-1])
             continue
         else:
             LOG.error("Export diff failed: %s" % out)
@@ -489,7 +486,7 @@ def get_instance_list(instance_list=None, tenant_list=None):
                 instance = nova.servers.get(instance_name)
                 if not instance:
                     LOG.warning("Cannot find instance with ID %s" % instance_name)
-                elif instance.name == instance_name:
+                elif instance_name in (instance.name, instance.id):
                     res.append(instance)
             else:
                 instances = nova.servers.list(search_opts={ 'name': instance_name, 'all_tenants': True })
