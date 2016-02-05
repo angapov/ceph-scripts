@@ -80,7 +80,6 @@ def looks_like_uuid(string):
     re_id = re.compile("[a-z0-9]+", re.I)
     like_uuid = len(string)==36 and bool(re_uuid.match(str(string)))
     like_id = len(string)==32 and bool(re_id.match(str(string)))
-    LOG.info("%s looks like uuid: %s" % (string, like_uuid or like_id) )
     return True if like_uuid or like_id else False
 
 def get_keystone_session():
