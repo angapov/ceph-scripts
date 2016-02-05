@@ -274,6 +274,7 @@ def timedelta(time2, time1):
     return (time2 - time1).total_seconds()
 
 def export_diff(instance, rbd_list, full_backup=False):
+    res = 0
     for rbd_image in rbd_list:
         snaps_list = snapshots_list(rbd_image)
         if not snaps_list:
@@ -302,6 +303,7 @@ def export_diff(instance, rbd_list, full_backup=False):
         dest_file = os.path.join(dest_dir, filename)
         cmd += dest_file
         out, rc = execute(cmd)
+        res += rc
         if rc==0: 
             if full_backup:
                 LOG.info("Full backup successfully taken. Removing previous backups.")
@@ -314,6 +316,7 @@ def export_diff(instance, rbd_list, full_backup=False):
             continue
         else:
             LOG.error("Export diff failed: %s" % out)
+    return res
 
 def rbd_import(rbd_image, filepath):
     pool = detect_pool(rbd_image)
@@ -331,16 +334,29 @@ def import_diff(rbd_image, filepath):
         #TODO Correct error LOG
         LOG.error(out, err)
 
+def full_backup_available(instance):
+    backups = get_backups(instance).values()
+    if all([backup.get('type')!='full' for backup in backups]):
+        return False
+    else:
+        return True
+
 def instance_backup(instance, dom, rbd_list, full_backup=False):
     LOG.info("="*80)
     if full_backup:
         LOG.info("Taking full backup of instance %s" % instance.name)
         remove_all_snapshots(rbd_list)
     else:
-        LOG.info("Taking incremental backup of instance %s" % instance.name)
+        # If no full backup found - take full backup instead of incremental
+        if not full_backup_available(instance):
+            full_backup = True
+            LOG.info("Taking full backup of instance %s" % instance.name)
+        else:
+            LOG.info("Taking incremental backup of instance %s" % instance.name)
     take_rbd_snapshots(dom, rbd_list, instance.name)
-    export_diff(instance, rbd_list, full_backup=full_backup)
-    LOG.info("Done")
+    res = export_diff(instance, rbd_list, full_backup=full_backup)
+    if res == 0:
+        LOG.info("Done")
     LOG.info("="*80)
 
 def restore_instance_inplace(instance, dest_date):
@@ -416,13 +432,12 @@ def p(width, date):
 
 def print_backup_list_header():
     d = "| "
-    INSTANCE = p(21, 'INSTANCE')
-    TENANT = p(26, 'PROJECT')
-    DATE = p(20, 'DATE')
-    TYPE = p(7, 'TYPE')
-    SIZE = p(9, 'SIZE(GB)')
-    FILES = 'FILES'
-    print("".join([d, INSTANCE, d, TENANT, d, DATE, d, TYPE, d, SIZE, d, FILES]))
+    INSTANCE = p(40, 'INSTANCE')
+    TENANT = p(40, 'PROJECT')
+    DATE = p(18, 'DATE')
+    TYPE = p(5, 'TYPE')
+    SIZE = p(7, 'SIZE(GB)')
+    print("".join([d, INSTANCE, d, TENANT, d, DATE, d, TYPE, d, SIZE]))
 
 def display_date(date):
     date = date.split('-')
@@ -446,26 +461,33 @@ def display_backups(instance):
             for file in files:
                 file_size, rc = execute("du -k %s | cut -f1" % file)
                 size += round(float(file_size)/1048576.0, 2)
-            if len(files)>1: # and bs[b]['type'] == 'full':
+            if len(files)>1:
                 for n, file in enumerate(files):
                     if n==0 and bs[b]['type'] == 'full':
-                        print(d, p(19, instance.name), d, p(24, tenant), d, p(18, display_date(b)), d, p(5, bs[b]['type']), \
-                              d, p(7, str(size)), "|", "." + file.replace(backup_dir, ""))
+                        print(d.join(("", p(40, instance.name), p(40, tenant), p(18, display_date(b)), p(5, bs[b]['type']), \
+                              p(7, str(size)), "")))
                     elif n==0 and bs[b]['type'] == 'inc':
-                        print(d, p(19, ""), d, p(24, ""), d, p(18, display_date(b)), d, p(5, bs[b]['type']), \
-                              d, p(7, str(size)), "|", "." + file.replace(backup_dir, ""))
+                        print(d.join(("", p(40, ""), p(40, ""), p(18, display_date(b)), p(5, bs[b]['type']), \
+                              p(7, str(size)), "")))
                     else:
-                        print(d, p(19, ""), d, p(24, ""),  d, p(18, ""), d, p(5, ""), d, p(7, ""), \
-                              "|", "." + file.replace(backup_dir, ""))
+                        continue
             elif bs[b]['type'] == 'full':
-                print(d, p(19, instance.name), d, p(24, tenant), d, p(18, display_date(b)), d, p(5, bs[b]['type']), \
-                      d, p(7, str(size)), "|", "." + files[0].replace(backup_dir, ""))
+                print(d.join(("", p(40, instance.name), p(40, tenant), p(18, display_date(b)), p(5, bs[b]['type']), \
+                      p(7, str(size)), "")))
             elif bs[b]['type'] == 'inc':
-                print(d, p(19, ""), d, p(24, ""), d, p(18, display_date(b)), d, p(5, bs[b]['type']), \
-                      d, p(7, str(size)), "|", "." + files[0].replace(backup_dir, ""))
+                if full_backup_available(instance):
+                    print(d.join(("", p(40, ""), p(40, ""), p(18, display_date(b)), p(5, bs[b]['type']), \
+                      p(7, str(size)), "")))
+                else:
+                    print(d.join(("", p(40, instance.name), p(40, tenant), p(18, display_date(b)), p(5, bs[b]['type']), \
+                      p(7, str(size)), "")))
 
     else:
-        print(d, p(19, instance.name), d, p(24, tenant),  d, p(18, ""), d, p(5, ""), d, p(7, ""), d)
+        if not instance_in_ceph(instance):
+            print(d.join(("", p(40, instance.name), p(40, tenant), p(34, "Nothing to backup"), "")))
+        else:
+            print(d.join(("", p(40, instance.name), p(40, tenant), p(18, ""), p(5, ""), p(7, ""), "")))
+
 
 def instance_in_ceph(instance):
     if instance.metadata.get('storage')=='rbd:ceph/vms':
@@ -513,7 +535,7 @@ def get_volume_list(volume_list=None, tenant_list=None, instance_list=None):
                 volume = cinder.volumes.get(volume_name)
                 if not volume:
                     LOG.warning("Cannot find volume with ID %s" % volume_name)
-                else:
+                elif volume_name in (volume.name, volume.id):
                     res.append(volume)
             else:
                 volumes = cinder.volumes.list( search_opts={'name': volume_name, 'all_tenants': True} )
@@ -685,9 +707,9 @@ LIST_BACKUPS = args.list_backups
 if args.instances and not LIST_BACKUPS and not BACKUP_TYPE and not RESTORE_DATE:
     print("ERROR: Instance list given but no action specified (choose from -b, -r or -l)")
 if LIST_BACKUPS:
-    header="+----------------------+---------------------------+---------" +\
-           "------------+--------+----------+----------------------" +\
-           "-----------------------------------" 
+    header="+-----------------------------------------+" + \
+           "-----------------------------------------+" + \
+           "-------------------+------+--------+"
     print(header.replace("-","="))
     print_backup_list_header()
     print(header.replace("-","="))
