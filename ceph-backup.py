@@ -73,7 +73,7 @@ def looks_like_date(string):
         time = strptime(string, TIME_FORMAT)
         return string
     except ValueError:
-        raise argparse.ArgumentTypeError("%s doesn't look like a valid date" % string)
+        return None
 
 def looks_like_uuid(string):
     re_uuid = re.compile("[0-F]{8}-[0-F]{4}-[0-F]{4}-[0-F]{4}-[0-F]{12}", re.I)
@@ -245,10 +245,11 @@ def guest_agent_available(dom):
     return True
 
 def snapshots_list(rbd_image):
-    sorted_by_time = [ snap['name'] for snap in sorted(list(rbd_image.list_snaps()), \
+    snap_list = [snap for snap in list(rbd_image.list_snaps()) if looks_like_date(snap['name'])]
+    sorted_by_time = [ snap['name'] for snap in sorted(snap_list, \
                         key=lambda f: strptime(f['name'], TIME_FORMAT)) ]
-    sorted_by_id   = [ snap['name'] for snap in sorted(list(rbd_image.list_snaps()), \
-                key=lambda f: int(f['id']))]
+    sorted_by_id   = [ snap['name'] for snap in sorted(snap_list, \
+                        key=lambda f: int(f['id']))]
     if sorted_by_time != sorted_by_id:
         LOG.warning("Snapshots list of %s is not ordered correctly, please check!" 
                 % rbd_image.name)
@@ -275,10 +276,12 @@ def timedelta(time2, time1):
 
 def export_diff(instance, rbd_list, full_backup=False):
     res = 0
+    dest_dir = None
     for rbd_image in rbd_list:
         snaps_list = snapshots_list(rbd_image)
         if not snaps_list:
-            LOG.error("No snapshots found for image %s ! Backup is not possible!" % rbd_image.name)
+            LOG.error("No proper snapshots found for image %s ! Backup is not possible!" % rbd_image.name)
+            res += 1
             continue
         snap = snaps_list[-1]
         pool = detect_pool(rbd_image.name)
@@ -294,6 +297,7 @@ def export_diff(instance, rbd_list, full_backup=False):
         else:
             if len(snaps_list)==1:
                 LOG.error("Only one snapshot found for image %s ! Incremental backup is not possible!" % rbd_image.name)
+                res += 1
                 continue
             LOG.info("Export-diff RBD image %s" % rbd_image.name)
             filename = "inc_" + rbd_image.name
@@ -303,19 +307,25 @@ def export_diff(instance, rbd_list, full_backup=False):
         dest_file = os.path.join(dest_dir, filename)
         cmd += dest_file
         out, rc = execute(cmd)
-        res += rc
         if rc==0: 
             if full_backup:
-                LOG.info("Full backup successfully taken. Removing previous backups.")
+                LOG.info("Full backup of %s successfully finished. Removing previous backups." % rbd_image.name)
                 upper_dir = os.path.join(dest_dir, '..')
                 for root, dirs, files in os.walk(upper_dir):
                     for dir in dirs:
                         if dir < snap:
                             shutil.rmtree(os.path.join(root, dir))
+            else:
+                LOG.info("Incremental backup of %s successfully finished." % rbd_image.name)
             map(rbd_image.remove_snap, snaps_list[:-1])
             continue
         else:
-            LOG.error("Export diff failed: %s" % out)
+            res += 1
+            LOG.error("RBD export failed: %s" % out)
+    if dest_dir:
+        status_file = os.path.join(dest_dir, 'status')
+        with open(status_file, "w+") as f:
+            f.write(str(res))
     return res
 
 def rbd_import(rbd_image, filepath):
@@ -539,6 +549,7 @@ def get_volume_list(volume_list=None, tenant_list=None, instance_list=None):
                     res.append(volume)
             else:
                 volumes = cinder.volumes.list( search_opts={'name': volume_name, 'all_tenants': True} )
+                volumes = [vol for vol in volumes if vol.name == volume_name]
                 if not volumes:
                     LOG.warning("Cannot find volume with name %s" % volume_name)
                 else:
@@ -552,7 +563,8 @@ def get_volume_list(volume_list=None, tenant_list=None, instance_list=None):
                 res.extend(volumes)
     # Don't include volumes that are already attached to target instances
     instance_id_list = [instance.id for instance in instance_list]
-    res = [vol for vol in res if vol.attachments and vol.attachments[0]['server_id'] not in instance_id_list]
+    res1 = [vol for vol in res if vol.attachments and vol.attachments[0]['server_id'] in instance_id_list]
+    res = [vol for vol in res if vol not in res1]
     return res
 
 def get_tenant_id_list(tenant_list):
@@ -679,9 +691,10 @@ LOG.basicConfig(filename=LOG_FILE, level=LOG.INFO,
 LOG.getLogger("requests").setLevel(LOG.WARNING)
 LOG.getLogger("paramiko").setLevel(LOG.WARNING)
 # Redirect uncaught exceptions to log file
-sys.excepthook = exception_handler
+if not sys.stdout.isatty():
+    sys.excepthook = exception_handler
 # Print logs to stdout also if it's a user terminal
-if sys.stdout.isatty() and not args.list_backups:
+elif not args.list_backups:
     log_to_stdout = LOG.StreamHandler()
     fmt = LOG.Formatter('%(levelname)s: %(message)s')
     log_to_stdout.setFormatter(fmt)
@@ -701,8 +714,6 @@ else:
 BACKUP_TYPE = args.backup_type
 RESTORE_DATE = args.restore_date
 LIST_BACKUPS = args.list_backups
-#print(its_show_time(config))
-#sys.exit()
 #root_disk_gb = nova.flavors.get(instance.flavor['id']).disk
 if args.instances and not LIST_BACKUPS and not BACKUP_TYPE and not RESTORE_DATE:
     print("ERROR: Instance list given but no action specified (choose from -b, -r or -l)")
@@ -722,8 +733,9 @@ for instance in sorted(INSTANCE_LIST, key=lambda f: f.tenant_id):
             (instance in INSTANCES_WITHOUT_ROOT):
         host = virsh_name = libvirt_conn = dom = None
         rbd_list = []
-        if (args.backup_root_disks and instance_in_ceph(instance)) or \
-                instance in INSTANCES_WITH_ROOT:
+        # Check instance was launched from image, otherwise skip Nova RBD disks lookup
+        if instance.image and ((args.backup_root_disks and instance_in_ceph(instance)) or \
+                instance in INSTANCES_WITH_ROOT):
             rbd_id = str(instance.id + "_disk")
             rbd_list.append(rbd.Image(VMS_POOL_IOCTX, rbd_id))
         volumes_attached = nova.volumes.get_server_volumes(instance.id)
@@ -753,11 +765,13 @@ for instance in sorted(INSTANCE_LIST, key=lambda f: f.tenant_id):
             rbd_image.close()
         libvirt_conn.close()
         continue
-    elif RESTORE_DATE: 
+    elif RESTORE_DATE and looks_like_date(RESTORE_DATE): 
         if len(INSTANCE_LIST)>1:
             print("ERROR: You may specify only a single instance to restore")
             sys.exit(1)
         restore_instance_inplace(instance, RESTORE_DATE)
+    elif RESTORE_DATE and not looks_like_date(RESTORE_DATE):
+        raise Exception("Restore date doesn't match date format: %s" % TIME_FORMAT)
 #    if VOLUMES_LIST:
 #        for volume in VOLUMES_LIST:
 #               full_backup(instance, dom, [rbd_image])
