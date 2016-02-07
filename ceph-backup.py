@@ -26,19 +26,36 @@ from glob import glob
 from fabric import api as fabric
 from datetime import datetime
 
+# Time format used for naming backup and snapshot
 TIME_FORMAT = '%Y-%m-%d-%H-%M'
 
 # Constants related to backup list output formatting
-INSTANCE_LEN = 40
-TENANT_LEN = 40
-DATE_LEN = 18
-TYPE_LEN = 5
-SIZE_LEN = 9
-STATUS_LEN = 7
-d = "| "
-header="+-----------------------------------------+" + \
-       "-----------------------------------------+" + \
-       "-------------------+------+----------+--------+"
+INSTANCE_LEN    = 40
+TENANT_LEN      = 40
+DATE_LEN        = 18
+TYPE_LEN        = 5
+SIZE_LEN        = 9
+STATUS_LEN      = 7
+d               = "| "
+header          = "+".join(("",
+                  "-"*(INSTANCE_LEN+1),  \
+                  "-"*(TENANT_LEN+1),    \
+                  "-"*(DATE_LEN+1),      \
+                  "-"*(TYPE_LEN+1),      \
+                  "-"*(SIZE_LEN+1),      \
+                  "-"*(STATUS_LEN+1),    \
+                  ""))
+
+# Terminal colors
+YELLOW  = '\033[33m'
+GREEN   = '\033[92m'
+RED     = '\033[31m'
+BROWN   = '\033[43m'
+END     = '\033[0m'
+
+# Backup status
+STATUS_OK = 'OK'
+STATUS_ERROR = 'ERROR'
 
 def parse_args_and_config():
     config = ConfigParser.ConfigParser()
@@ -79,6 +96,24 @@ def parse_args_and_config():
                         help="Backup root disks of instances also (default: False)")
     args = parser.parse_args(remaining_argv)
     return args, config
+
+def check_directory_is_writeable(dir):
+    if os.access(dir, os.W_OK):
+        with open(os.path.join(dir, 'test'), "w+") as f:
+            try:
+                f.write('test')
+            except IOError:
+                msg = "%s directory is not writeable. Check free space or permissions!" % dir
+                LOG.exception(msg)
+                raise sys.exit(msg)
+            finally:
+                try:
+                    os.remove(os.path.join(dir, 'test'))
+                except:
+                    pass
+    else:
+        LOG.exception("No write access to %s. Check permissions." % dir)
+        raise sys.exit(1)
 
 def looks_like_date(string):
     try:
@@ -321,12 +356,7 @@ def export_diff(instance, rbd_list, full_backup=False):
         out, rc = execute(cmd)
         if rc==0: 
             if full_backup:
-                LOG.info("Full backup of %s successfully finished. Removing previous backups." % rbd_image.name)
-                upper_dir = os.path.join(dest_dir, '..')
-                for root, dirs, files in os.walk(upper_dir):
-                    for dir in dirs:
-                        if dir < snap:
-                            shutil.rmtree(os.path.join(root, dir))
+                LOG.info("Full backup of %s successfully finished." % rbd_image.name)
             else:
                 LOG.info("Incremental backup of %s successfully finished." % rbd_image.name)
             map(rbd_image.remove_snap, snaps_list[:-1])
@@ -338,6 +368,16 @@ def export_diff(instance, rbd_list, full_backup=False):
         status_file = os.path.join(dest_dir, 'status')
         with open(status_file, "w+") as f:
             f.write(str(res))
+    if full_backup and res == 0:
+        backups = get_backups(instance)
+        full_backup_dates = [d for d in sorted(backups.keys()) if backups[d].get('type') == 'full']
+        if len(backups) > 7*(BACKUP_RETENTION_WEEKS+1) and len(full_backup_dates)>=2:
+            date1, date2 = full_backup_dates[0], full_backup_dates[1]
+            upper_dir = os.path.join(dest_dir, '..')
+            for root, dirs, files in os.walk(upper_dir):
+                for dir in dirs:
+                    if date1 <= dir < date2:
+                        shutil.rmtree(os.path.join(root, dir))
     return res
 
 def rbd_import(rbd_image, filepath):
@@ -436,6 +476,13 @@ def get_backups(instance):
     if os.path.exists(backup_dir):
         dates = [dir for dir in os.listdir(backup_dir) if os.path.isdir(os.path.join(backup_dir, dir))]
         for date in dates:
+            status_file = os.path.join(backup_dir, date, 'status')
+            status = STATUS_ERROR
+            if os.path.exists(status_file):
+                with open(status_file) as f:
+                    status = f.read()
+            if status == '0':
+                status = STATUS_OK
             os.chdir(os.path.join(backup_dir, date))
             backups[date] = {}
             full_root_backups = map(os.path.realpath, glob('./full_*_disk'))
@@ -443,9 +490,13 @@ def get_backups(instance):
             full_vol_backups  = map(os.path.realpath, glob('./full_volume-*'))
             inc_vol_backups   = map(os.path.realpath, glob('./inc_volume-*'))
             if (full_root_backups or full_vol_backups) and not (inc_root_backups or inc_vol_backups):
-                backups[date] = { 'type': 'full', 'files': full_root_backups + full_vol_backups }
+                backups[date] = { 'type': 'full', 
+                                  'files': full_root_backups + full_vol_backups,
+                                  'status': status }
             if (inc_root_backups or inc_vol_backups) and not (full_root_backups or full_vol_backups):
-                backups[date] = { 'type': 'inc', 'files': inc_root_backups + inc_vol_backups }
+                backups[date] = { 'type': 'inc', 
+                                  'files': inc_root_backups + inc_vol_backups,
+                                  'status': status }
     return backups
 
 def p(width, date):
@@ -476,44 +527,41 @@ def display_backups(instance):
         for b in sorted(bs.keys()):
             size = float(0)
             files = bs[b].get('files')
-            status_file = os.path.join(backup_dir,  b, 'status')
-            status = 'ERROR'
-            if os.path.exists(status_file):
-                with open(status_file) as f:
-                    status = f.read()
-            if status == '0':
-                status = 'OK'
             if not files:
                 print("No backup files found for %s (%s)" % (instance.name, instance.id))
                 continue
             for file in files:
                 file_size, rc = execute("du -k %s | cut -f1" % file)
                 size += round(float(file_size)/1048576.0, 2)
+            status = bs[b]['status']
+            status = GREEN + STATUS_OK + END if status == STATUS_OK \
+                    else RED + STATUS_ERROR + END
             if len(files)>1:
                 for n, file in enumerate(files):
                     if n==0 and bs[b]['type'] == 'full':
                         print(d.join(("", p(INSTANCE_LEN, instance.name), p(TENANT_LEN, tenant), p(DATE_LEN, display_date(b)), \
-                                p(TYPE_LEN, bs[b]['type']), p(SIZE_LEN, str(size)), p(STATUS_LEN, status), "")))
+                                p(TYPE_LEN, bs[b]['type']), p(SIZE_LEN, str(size)), p(STATUS_LEN+9, status), "")))
                     elif n==0 and bs[b]['type'] == 'inc':
                         print(d.join(("", p(INSTANCE_LEN, ""), p(TENANT_LEN, ""), p(DATE_LEN, display_date(b)), \
-                                p(TYPE_LEN, bs[b]['type']), p(SIZE_LEN, str(size)), p(STATUS_LEN, status), "")))
+                                p(TYPE_LEN, bs[b]['type']), p(SIZE_LEN, str(size)), p(STATUS_LEN+9, status), "")))
                     else:
                         continue
             elif bs[b]['type'] == 'full':
                 print(d.join(("", p(INSTANCE_LEN, instance.name), p(TENANT_LEN, tenant), p(DATE_LEN, display_date(b)), \
-                        p(TYPE_LEN, bs[b]['type']), p(SIZE_LEN, str(size)), p(STATUS_LEN, status), "")))
+                        p(TYPE_LEN, bs[b]['type']), p(SIZE_LEN, str(size)), p(STATUS_LEN+9, status), "")))
             elif bs[b]['type'] == 'inc':
                 if full_backup_available(instance):
                     print(d.join(("", p(INSTANCE_LEN, ""), p(TENANT_LEN, ""), p(DATE_LEN, display_date(b)), p(TYPE_LEN, bs[b]['type']), \
-                      p(SIZE_LEN, str(size)), p(STATUS_LEN, status), "")))
+                      p(SIZE_LEN, str(size)), p(STATUS_LEN+9, status), "")))
                 else:
                     print(d.join(("", p(INSTANCE_LEN, instance.name), p(TENANT_LEN, tenant), p(DATE_LEN, display_date(b)), p(TYPE_LEN, bs[b]['type']), \
-                      p(SIZE_LEN, str(size)), p(STATUS_LEN, status), "")))
+                      p(SIZE_LEN, str(size)), p(STATUS_LEN+9, status), "")))
 
     else:
         if not instance_in_ceph(instance):
+            l = '{:^%s}' % (DATE_LEN + TYPE_LEN + SIZE_LEN + STATUS_LEN + len(YELLOW) + len(END) + 6)
             print(d.join(("", p(INSTANCE_LEN, instance.name), p(TENANT_LEN, tenant), \
-                    p(DATE_LEN + TYPE_LEN + SIZE_LEN + STATUS_LEN + 6, "*** Nothing to backup ***"), "")))
+                    l.format(YELLOW + "--==( Nothing to backup )==--" + END ), "")))
         else:
             print(d.join(("", p(INSTANCE_LEN, instance.name), p(TENANT_LEN, tenant), p(DATE_LEN, ""), \
                     p(DATE_LEN, ""), p(TYPE_LEN, ""), p(STATUS_LEN, ""), "")))
@@ -692,10 +740,12 @@ LIBVIRT_URI         = defaults['libvirt_uri']
 SSH_USER            = defaults['ssh_user']
 SSH_KEY             = defaults['ssh_key']
 LOG_FILE            = defaults['log_file']
+BACKUP_RETENTION_WEEKS = int(defaults['backup_retention_weeks'])
 ceph_cluster = rados.Rados(conffile='/etc/ceph/ceph.conf')
 ceph_cluster.connect()
 VMS_POOL_IOCTX = ceph_cluster.open_ioctx(VMS_POOL)
 VOLUMES_POOL_IOCTX = ceph_cluster.open_ioctx(VOLUMES_POOL)
+
 
 # Get Keystone, Nova and Cinder sessions
 session, keystone = get_keystone_session()
@@ -719,6 +769,8 @@ elif not args.list_backups:
     fmt = LOG.Formatter('%(levelname)s: %(message)s')
     log_to_stdout.setFormatter(fmt)
     LOG.getLogger().addHandler(log_to_stdout)
+
+check_directory_is_writeable(BACKUPS_TOP_DIR)
 
 if args.instances:
     INSTANCE_LIST = get_instance_list(instance_list=",".join(args.instances))
