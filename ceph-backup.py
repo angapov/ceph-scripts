@@ -28,6 +28,18 @@ from datetime import datetime
 
 TIME_FORMAT = '%Y-%m-%d-%H-%M'
 
+# Constants related to backup list output formatting
+INSTANCE_LEN = 40
+TENANT_LEN = 40
+DATE_LEN = 18
+TYPE_LEN = 5
+SIZE_LEN = 9
+STATUS_LEN = 7
+d = "| "
+header="+-----------------------------------------+" + \
+       "-----------------------------------------+" + \
+       "-------------------+------+----------+--------+"
+
 def parse_args_and_config():
     config = ConfigParser.ConfigParser()
     conf_parser = argparse.ArgumentParser(add_help=False, 
@@ -441,13 +453,13 @@ def p(width, date):
     return w.format(date)
 
 def print_backup_list_header():
-    d = "| "
-    INSTANCE = p(40, 'INSTANCE')
-    TENANT = p(40, 'PROJECT')
-    DATE = p(18, 'DATE')
-    TYPE = p(5, 'TYPE')
-    SIZE = p(7, 'SIZE(GB)')
-    print("".join([d, INSTANCE, d, TENANT, d, DATE, d, TYPE, d, SIZE]))
+    INSTANCE = p(INSTANCE_LEN, 'INSTANCE')
+    TENANT = p(TENANT_LEN, 'PROJECT')
+    DATE = p(DATE_LEN, 'DATE')
+    TYPE = p(TYPE_LEN, 'TYPE')
+    SIZE = p(SIZE_LEN, 'SIZE(GB)')
+    STATUS = p(STATUS_LEN, 'STATUS')
+    print(d.join(("", INSTANCE, TENANT, DATE, TYPE, SIZE, STATUS, "")))
 
 def display_date(date):
     date = date.split('-')
@@ -459,12 +471,18 @@ def display_backups(instance):
     bs = get_backups(instance)
     tenant = get_tenant_name_by_id(instance.tenant_id, instance.id)
     instance_name = instance.name.replace(" ", "_").replace("/", "")
-    d = "| "
     if bs:
         backup_dir = "/".join((BACKUPS_TOP_DIR, instance_name + "_" + instance.id))
         for b in sorted(bs.keys()):
             size = float(0)
             files = bs[b].get('files')
+            status_file = os.path.join(backup_dir,  b, 'status')
+            status = 'ERROR'
+            if os.path.exists(status_file):
+                with open(status_file) as f:
+                    status = f.read()
+            if status == '0':
+                status = 'OK'
             if not files:
                 print("No backup files found for %s (%s)" % (instance.name, instance.id))
                 continue
@@ -474,29 +492,31 @@ def display_backups(instance):
             if len(files)>1:
                 for n, file in enumerate(files):
                     if n==0 and bs[b]['type'] == 'full':
-                        print(d.join(("", p(40, instance.name), p(40, tenant), p(18, display_date(b)), p(5, bs[b]['type']), \
-                              p(7, str(size)), "")))
+                        print(d.join(("", p(INSTANCE_LEN, instance.name), p(TENANT_LEN, tenant), p(DATE_LEN, display_date(b)), \
+                                p(TYPE_LEN, bs[b]['type']), p(SIZE_LEN, str(size)), p(STATUS_LEN, status), "")))
                     elif n==0 and bs[b]['type'] == 'inc':
-                        print(d.join(("", p(40, ""), p(40, ""), p(18, display_date(b)), p(5, bs[b]['type']), \
-                              p(7, str(size)), "")))
+                        print(d.join(("", p(INSTANCE_LEN, ""), p(TENANT_LEN, ""), p(DATE_LEN, display_date(b)), \
+                                p(TYPE_LEN, bs[b]['type']), p(SIZE_LEN, str(size)), p(STATUS_LEN, status), "")))
                     else:
                         continue
             elif bs[b]['type'] == 'full':
-                print(d.join(("", p(40, instance.name), p(40, tenant), p(18, display_date(b)), p(5, bs[b]['type']), \
-                      p(7, str(size)), "")))
+                print(d.join(("", p(INSTANCE_LEN, instance.name), p(TENANT_LEN, tenant), p(DATE_LEN, display_date(b)), \
+                        p(TYPE_LEN, bs[b]['type']), p(SIZE_LEN, str(size)), p(STATUS_LEN, status), "")))
             elif bs[b]['type'] == 'inc':
                 if full_backup_available(instance):
-                    print(d.join(("", p(40, ""), p(40, ""), p(18, display_date(b)), p(5, bs[b]['type']), \
-                      p(7, str(size)), "")))
+                    print(d.join(("", p(INSTANCE_LEN, ""), p(TENANT_LEN, ""), p(DATE_LEN, display_date(b)), p(TYPE_LEN, bs[b]['type']), \
+                      p(SIZE_LEN, str(size)), p(STATUS_LEN, status), "")))
                 else:
-                    print(d.join(("", p(40, instance.name), p(40, tenant), p(18, display_date(b)), p(5, bs[b]['type']), \
-                      p(7, str(size)), "")))
+                    print(d.join(("", p(INSTANCE_LEN, instance.name), p(TENANT_LEN, tenant), p(DATE_LEN, display_date(b)), p(TYPE_LEN, bs[b]['type']), \
+                      p(SIZE_LEN, str(size)), p(STATUS_LEN, status), "")))
 
     else:
         if not instance_in_ceph(instance):
-            print(d.join(("", p(40, instance.name), p(40, tenant), p(34, "Nothing to backup"), "")))
+            print(d.join(("", p(INSTANCE_LEN, instance.name), p(TENANT_LEN, tenant), \
+                    p(DATE_LEN + TYPE_LEN + SIZE_LEN + STATUS_LEN + 6, "*** Nothing to backup ***"), "")))
         else:
-            print(d.join(("", p(40, instance.name), p(40, tenant), p(18, ""), p(5, ""), p(7, ""), "")))
+            print(d.join(("", p(INSTANCE_LEN, instance.name), p(TENANT_LEN, tenant), p(DATE_LEN, ""), \
+                    p(DATE_LEN, ""), p(TYPE_LEN, ""), p(STATUS_LEN, ""), "")))
 
 
 def instance_in_ceph(instance):
@@ -718,9 +738,6 @@ LIST_BACKUPS = args.list_backups
 if args.instances and not LIST_BACKUPS and not BACKUP_TYPE and not RESTORE_DATE:
     print("ERROR: Instance list given but no action specified (choose from -b, -r or -l)")
 if LIST_BACKUPS:
-    header="+-----------------------------------------+" + \
-           "-----------------------------------------+" + \
-           "-------------------+------+--------+"
     print(header.replace("-","="))
     print_backup_list_header()
     print(header.replace("-","="))
