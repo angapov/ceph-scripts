@@ -28,6 +28,7 @@ from datetime import datetime
 
 # Time format used for naming backup and snapshot
 TIME_FORMAT = '%Y-%m-%d-%H-%M'
+USER_TIME_FORMAT = '%d-%m-%Y %H:%M'
 
 # Constants related to backup list output formatting
 INSTANCE_LEN    = 40
@@ -81,7 +82,6 @@ def parse_args_and_config():
                         help="List available backups for instances")
     group.add_argument( "-r",
                         dest='restore_date',
-                        type = looks_like_date,
                         help="Restore list of instances inplace to given date (backup will"
                              " replace the existing instances)")
     parser.add_argument("-i",
@@ -115,9 +115,9 @@ def check_directory_is_writeable(dir):
         LOG.exception("No write access to %s. Check permissions." % dir)
         raise sys.exit(1)
 
-def looks_like_date(string):
+def looks_like_date(string, time_format=TIME_FORMAT):
     try:
-        time = strptime(string, TIME_FORMAT)
+        time = strptime(string, time_format)
         return string
     except ValueError:
         return None
@@ -153,6 +153,8 @@ def execute(cmd, host=None):
         return execute_remote_cmd(cmd, host)
     p = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
     out, err = p.communicate()
+    if err:
+        out += str(err)
     rc = p.returncode
     return (out, rc)
 
@@ -321,21 +323,27 @@ def current_time():
 def timedelta(time2, time1):
     return (time2 - time1).total_seconds()
 
+def ensure_dir(dir):
+    if not os.path.exists(dir):
+        os.makedirs(dir)
+
 def export_diff(instance, rbd_list, full_backup=False):
     res = 0
     dest_dir = None
+    curr_time = current_time()
     for rbd_image in rbd_list:
         snaps_list = snapshots_list(rbd_image)
         if not snaps_list:
             LOG.error("No proper snapshots found for image %s ! Backup is not possible!" % rbd_image.name)
+            dest_dir = "/".join((BACKUPS_TOP_DIR, instance_name + "_" + instance.id, curr_time))
+            ensure_dir(dest_dir)
             res += 1
             continue
         snap = snaps_list[-1]
         pool = detect_pool(rbd_image.name)
         instance_name = instance.name.replace(" ", "_").replace("/", "")
         dest_dir = "/".join((BACKUPS_TOP_DIR, instance_name + "_" + instance.id, snap))
-        if not os.path.exists(dest_dir):
-            os.makedirs(dest_dir)
+        ensure_dir(dest_dir)
         if full_backup:
             LOG.info("Export RBD image %s" % rbd_image.name)
             filename = "full_" + rbd_image.name
@@ -344,6 +352,8 @@ def export_diff(instance, rbd_list, full_backup=False):
         else:
             if len(snaps_list)==1:
                 LOG.error("Only one snapshot found for image %s ! Incremental backup is not possible!" % rbd_image.name)
+                dest_dir = "/".join((BACKUPS_TOP_DIR, instance_name + "_" + instance.id, curr_time))
+                ensure_dir(dest_dir)
                 res += 1
                 continue
             LOG.info("Export-diff RBD image %s" % rbd_image.name)
@@ -386,7 +396,7 @@ def rbd_import(rbd_image, filepath):
     out, rc = execute(cmd)
     if rc!=0:
         #TODO Correct error LOG
-        LOG.error(out, err)
+        LOG.error(out)
 
 def import_diff(rbd_image, filepath):
     pool = detect_pool(rbd_image)
@@ -394,7 +404,7 @@ def import_diff(rbd_image, filepath):
     out, rc = execute(cmd)
     if rc!=0:
         #TODO Correct error LOG
-        LOG.error(out, err)
+        LOG.error(out)
 
 def full_backup_available(instance):
     backups = get_backups(instance).values()
@@ -517,6 +527,12 @@ def display_date(date):
     time = ":".join((date[3], date[4]))
     date = "-".join((date[2], date[1], date[0]))
     return " ".join((date, time))
+
+def format_user_date(date):
+    date = date.split(' ')
+    time = date[1].replace(':', '-')
+    date = '-'.join(date[0].split('-')[::-1])
+    return '-'.join((date, time))
 
 def display_backups(instance):
     bs = get_backups(instance)
@@ -834,7 +850,15 @@ for instance in sorted(INSTANCE_LIST, key=lambda f: f.tenant_id):
             rbd_image.close()
         libvirt_conn.close()
         continue
-    elif RESTORE_DATE and looks_like_date(RESTORE_DATE): 
+    elif RESTORE_DATE:
+        if looks_like_date(RESTORE_DATE):
+            pass
+        elif looks_like_date(RESTORE_DATE, time_format=USER_TIME_FORMAT):
+            RESTORE_DATE = format_user_date(RESTORE_DATE)
+        else:
+            raise Exception("Restore date doesn't match date format: %s or %s" 
+                                % (TIME_FORMAT, USER_TIME_FORMAT))
+            sys.exit(1)
         if len(INSTANCE_LIST)>1:
             print("ERROR: You may specify only a single instance to restore")
             sys.exit(1)
