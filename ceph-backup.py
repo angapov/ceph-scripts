@@ -630,7 +630,7 @@ def display_backups(instance):
 def instance_in_ceph(instance):
     if instance.metadata.get('storage')=='rbd:ceph/vms':
         return True
-    else:
+    elif not LIST_BACKUPS:
         LOG.warning("Instance %s is not stored in Ceph, its root disk will not be backed up (volumes will be)!" \
                 % instance.name)
         return False
@@ -831,6 +831,9 @@ elif not args.list_backups:
     LOG.getLogger().addHandler(log_to_stdout)
 
 check_directory_is_writeable(BACKUPS_TOP_DIR)
+BACKUP_TYPE = args.backup_type
+RESTORE_DATE = args.restore_date
+LIST_BACKUPS = args.list_backups
 
 if args.instances:
     INSTANCE_LIST = get_instance_list(instance_list=",".join(args.instances))
@@ -843,10 +846,6 @@ else:
     VOLUMES_LIST = BACKUP_TARGETS['volumes']
     INSTANCE_LIST = INSTANCES_WITH_ROOT + INSTANCES_WITHOUT_ROOT
 
-BACKUP_TYPE = args.backup_type
-RESTORE_DATE = args.restore_date
-LIST_BACKUPS = args.list_backups
-#root_disk_gb = nova.flavors.get(instance.flavor['id']).disk
 if args.instances and not LIST_BACKUPS and not BACKUP_TYPE and not RESTORE_DATE:
     print("ERROR: Instance list given but no action specified (choose from -b, -r or -l)")
 if LIST_BACKUPS:
@@ -924,8 +923,7 @@ for image in old_images:
     with get_rbd_image_obj(image) as rbd_img:
         remove_all_snapshots([rbd_img])
     try:
-        rbd_inst.remove(VOLUMES_POOL_IOCTX, image)
-        rbd_inst.remove(VMS_POOL_IOCTX, image)
+        rbd_inst.remove(get_pool_ioctx(image), image)
     except rbd.ImageNotFound:
         pass
 VMS_POOL_IOCTX.close()
