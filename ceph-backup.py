@@ -193,6 +193,11 @@ def rename_rbd(rbd_name, new_name):
     rbd_inst = rbd.RBD()
     rbd_inst.rename(ioctx, rbd_name, new_name)
 
+def rbd_image_exists(rbd_name):
+    ioctx = get_pool_ioctx(rbd_name)
+    rbd_inst = rbd.RBD()
+    return True if rbd_name in rbd_inst.list(ioctx) else False
+
 def freeze_vm(dom):
     ret = dom.fsFreeze()
 
@@ -202,6 +207,7 @@ def thaw_vm(dom):
 def rbd_snap_create(rbd_name, snap_name):
     ioctx = get_pool_ioctx(rbd_name)
     with rbd.Image(ioctx, rbd_name) as rbd_img:
+        rbd_img.flush()
         rbd_img.create_snap(snap_name)
 
 def exec_with_timeout(func, args=(), timeout=60):
@@ -234,6 +240,7 @@ def take_simple_snapshots(rbd_list, instance_name):
         sleep(5)
         time1 = datetime.now()
         LOG.info("-- Snapshoting %s (+0.00 sec)" % rbd_name)
+        rbd_image.flush()
         exec_with_timeout(rbd_image.create_snap, (curr_time,))
         time2 = datetime.now()
         LOG.info("-- Done snapshoting %s (+%s sec)" % \
@@ -253,9 +260,13 @@ def take_rbd_snapshots(dom, rbd_list, instance_name):
                 rbd_name = "%s/%s" % (detect_pool(rbd_image.name), rbd_image.name)
                 sleep(2)
                 LOG.info("-- Snapshoting %s" % rbd_name)
-                cmd = 'rbd snap create %s --snap %s' % (rbd_name, curr_time)
-                exec_with_timeout(execute, (cmd,))
-                #exec_with_timeout(rbd_image.create_snap, (curr_time,))
+                if curr_time not in snapshots_list(rbd_image):
+                    rbd_image.flush()
+                    cmd = 'rbd snap create %s --snap %s' % (rbd_name, curr_time)
+                    exec_with_timeout(execute, (cmd,))
+                    #exec_with_timeout(rbd_image.create_snap, (curr_time,))
+                else:
+                    continue
             LOG.info("Thawing %s (+%s sec)" \
                     % (instance_name, timedelta(datetime.now(), time1)))
             thaw_vm(dom)
@@ -267,10 +278,13 @@ def take_rbd_snapshots(dom, rbd_list, instance_name):
             for rbd_image in rbd_list:
                 sleep(5)
                 rbd_name = "%s/%s" % (detect_pool(rbd_image.name), rbd_image.name)
-                cmd = 'rbd snap create %s --snap %s' % (rbd_name, curr_time)
-                exec_with_timeout(execute, (cmd,))
-            #take_simple_snapshots(rbd_list, instance_name)
-        except Exception, msg:
+                if curr_time not in snapshots_list(rbd_image):
+                    rbd_image.flush()
+                    cmd = 'rbd snap create %s --snap %s' % (rbd_name, curr_time)
+                    exec_with_timeout(execute, (cmd,))
+                else:
+                    continue
+        except Exception as msg:
             LOG.exception(msg)
     else:
         if not dom.isActive():
@@ -280,9 +294,12 @@ def take_rbd_snapshots(dom, rbd_list, instance_name):
         for rbd_image in rbd_list:
             sleep(5)
             rbd_name = "%s/%s" % (detect_pool(rbd_image.name), rbd_image.name)
-            cmd = 'rbd snap create %s --snap %s' % (rbd_name, curr_time)
-            exec_with_timeout(execute, (cmd,))
-        #take_simple_snapshots(rbd_list, instance_name)
+            if curr_time not in snapshots_list(rbd_image):
+                rbd_image.flush()
+                cmd = 'rbd snap create %s --snap %s' % (rbd_name, curr_time)
+                exec_with_timeout(execute, (cmd,))
+            else:
+                continue
     LOG.info("Snapshots finished for %s" % instance_name)
 
 def guest_agent_available(dom):
@@ -327,10 +344,21 @@ def ensure_dir(dir):
     if not os.path.exists(dir):
         os.makedirs(dir)
 
+def remove_empty_subdirs(directory):
+    for root, dirs, files in os.walk(directory):
+        for dir in dirs:
+            dir = os.path.join(root, dir)
+            if not os.listdir(dir):
+                try:
+                    os.rmdir(dir)
+                except:
+                    pass
+
 def export_diff(instance, rbd_list, full_backup=False):
     res = 0
     dest_dir = None
     curr_time = current_time()
+    instance_name = instance.name.replace(" ", "_").replace("/", "")
     for rbd_image in rbd_list:
         snaps_list = snapshots_list(rbd_image)
         if not snaps_list:
@@ -341,7 +369,6 @@ def export_diff(instance, rbd_list, full_backup=False):
             continue
         snap = snaps_list[-1]
         pool = detect_pool(rbd_image.name)
-        instance_name = instance.name.replace(" ", "_").replace("/", "")
         dest_dir = "/".join((BACKUPS_TOP_DIR, instance_name + "_" + instance.id, snap))
         ensure_dir(dest_dir)
         if full_backup:
@@ -358,7 +385,18 @@ def export_diff(instance, rbd_list, full_backup=False):
                 continue
             LOG.info("Export-diff RBD image %s" % rbd_image.name)
             filename = "inc_" + rbd_image.name
-            from_snap = snaps_list[-2]
+            from_snap = None
+            # Find the latest snapshot for which backup of any type is available
+            # In normal conditions this snapshot must be the first one
+            # We must start from the second from the end (-2 index)
+            for n in range(2, len(snaps_list)+1):
+                if backup_is_available(instance, snaps_list[-n], rbd_image.name):
+                    from_snap = snaps_list[-n]
+                    break
+            if not from_snap:
+                LOG.error("DANGER! No previous backups found for current RBD snapshots! Backup chain is likely to be broken")
+                res+=1
+                continue
             cmd = "rbd export-diff --no-progress %s/%s --snap %s --from-snap %s " \
                     % (pool, rbd_image.name, snap, from_snap)
         dest_file = os.path.join(dest_dir, filename)
@@ -377,7 +415,8 @@ def export_diff(instance, rbd_list, full_backup=False):
     if dest_dir:
         status_file = os.path.join(dest_dir, 'status')
         with open(status_file, "w+") as f:
-            f.write(str(res))
+            f.write(str(res) + '\n')
+    remove_empty_subdirs("/".join((BACKUPS_TOP_DIR, instance_name + "_" + instance.id)))
     if full_backup and res == 0:
         backups = get_backups(instance)
         full_backup_dates = [d for d in sorted(backups.keys()) if backups[d].get('type') == 'full']
@@ -408,7 +447,7 @@ def import_diff(rbd_image, filepath):
 
 def full_backup_available(instance):
     backups = get_backups(instance).values()
-    if all([backup.get('type')!='full' for backup in backups]):
+    if not backups or all([backup.get('type')!='full' for backup in backups]):
         return False
     else:
         return True
@@ -422,6 +461,7 @@ def instance_backup(instance, dom, rbd_list, full_backup=False):
         # If no full backup found - take full backup instead of incremental
         if not full_backup_available(instance):
             full_backup = True
+            LOG.info("No previous full backup found of %s" % instance.name) 
             LOG.info("Taking full backup of instance %s" % instance.name)
         else:
             LOG.info("Taking incremental backup of instance %s" % instance.name)
@@ -456,12 +496,16 @@ def restore_instance_inplace(instance, dest_date):
             if backups[date]['type']=='full':
                 for file in backups[date]['files']:
                     if root_rbd_id in file:
+                        if rbd_image_exists(root_rbd_id + ".bak"):
+                            delete_rbd_by_name(root_rbd_id + ".bak")
                         rename_rbd(root_rbd_id, root_rbd_id + ".bak")
                         rbd_import(root_rbd_id, file)
                         rbd_snap_create(root_rbd_id, str(date))
                     else:
                         for volume in volume_ids:
                             if volume in file:
+                                if rbd_image_exists(volume + ".bak"):
+                                    delete_rbd_by_name(volume + ".bak")
                                 rename_rbd(volume, volume + ".bak")
                                 rbd_import(volume, file)
                                 rbd_snap_create(volume, str(date))
@@ -490,7 +534,7 @@ def get_backups(instance):
             status = STATUS_ERROR
             if os.path.exists(status_file):
                 with open(status_file) as f:
-                    status = f.read()
+                    status = f.read().strip()
             if status == '0':
                 status = STATUS_OK
             os.chdir(os.path.join(backup_dir, date))
@@ -508,6 +552,15 @@ def get_backups(instance):
                                   'files': inc_root_backups + inc_vol_backups,
                                   'status': status }
     return backups
+
+def backup_is_available(instance, date, rbd_name):
+    backup_dir = "/".join((BACKUPS_TOP_DIR, instance.name + "_" + instance.id, date))
+    if not os.path.isdir(backup_dir) or not os.listdir(backup_dir):
+        return False
+    if any([rbd_name in file for file in os.listdir(backup_dir)]):
+        return True
+    else:
+        return False
 
 def p(width, date):
     w = '{:%s}' % width
@@ -535,53 +588,44 @@ def format_user_date(date):
     return '-'.join((date, time))
 
 def display_backups(instance):
+    def print_line(instance, tenant, date, backup_type, size, status):
+        print(d.join(("", p(INSTANCE_LEN, instance), p(TENANT_LEN, tenant), p(DATE_LEN, date), \
+                p(TYPE_LEN, backup_type), p(SIZE_LEN, str(size)), p(STATUS_LEN+9, status), "")))
     bs = get_backups(instance)
     tenant = get_tenant_name_by_id(instance.tenant_id, instance.id)
     instance_name = instance.name.replace(" ", "_").replace("/", "")
     if bs:
         backup_dir = "/".join((BACKUPS_TOP_DIR, instance_name + "_" + instance.id))
-        for b in sorted(bs.keys()):
+        for i, b in enumerate(sorted(bs.keys())):
             size = float(0)
             files = bs[b].get('files')
             if not files:
-                print("No backup files found for %s (%s)" % (instance.name, instance.id))
-                continue
+                files = []
             for file in files:
                 file_size, rc = execute("du -k %s | cut -f1" % file)
                 size += round(float(file_size)/1048576.0, 2)
-            status = bs[b]['status']
+            status = bs[b].get('status')
             status = GREEN + STATUS_OK + END if status == STATUS_OK \
                     else RED + STATUS_ERROR + END
-            if len(files)>1:
-                for n, file in enumerate(files):
-                    if n==0 and bs[b]['type'] == 'full':
-                        print(d.join(("", p(INSTANCE_LEN, instance.name), p(TENANT_LEN, tenant), p(DATE_LEN, display_date(b)), \
-                                p(TYPE_LEN, bs[b]['type']), p(SIZE_LEN, str(size)), p(STATUS_LEN+9, status), "")))
-                    elif n==0 and bs[b]['type'] == 'inc':
-                        print(d.join(("", p(INSTANCE_LEN, ""), p(TENANT_LEN, ""), p(DATE_LEN, display_date(b)), \
-                                p(TYPE_LEN, bs[b]['type']), p(SIZE_LEN, str(size)), p(STATUS_LEN+9, status), "")))
-                    else:
-                        continue
-            elif bs[b]['type'] == 'full':
-                print(d.join(("", p(INSTANCE_LEN, instance.name), p(TENANT_LEN, tenant), p(DATE_LEN, display_date(b)), \
-                        p(TYPE_LEN, bs[b]['type']), p(SIZE_LEN, str(size)), p(STATUS_LEN+9, status), "")))
-            elif bs[b]['type'] == 'inc':
-                if full_backup_available(instance):
-                    print(d.join(("", p(INSTANCE_LEN, ""), p(TENANT_LEN, ""), p(DATE_LEN, display_date(b)), p(TYPE_LEN, bs[b]['type']), \
-                      p(SIZE_LEN, str(size)), p(STATUS_LEN+9, status), "")))
-                else:
-                    print(d.join(("", p(INSTANCE_LEN, instance.name), p(TENANT_LEN, tenant), p(DATE_LEN, display_date(b)), p(TYPE_LEN, bs[b]['type']), \
-                      p(SIZE_LEN, str(size)), p(STATUS_LEN+9, status), "")))
-
+            backup_type = bs[b].get('type')
+            if i == 0 and backup_type:
+                print_line(instance.name, tenant, display_date(b), backup_type, size, status)
+            elif i == 0 and not backup_type:
+                print_line(instance.name, tenant, display_date(b), '---', '---', status)
+            elif backup_type:
+                print_line("", "", display_date(b), backup_type, size, status)
+            elif len(bs)>1 and i!=0:
+                print_line("", "", display_date(b), '---', '---', status)
+            else:
+                print_line(instance.name, tenant, display_date(b), '---', '---', status)
     else:
+        l = '{:^%s}' % (DATE_LEN + TYPE_LEN + SIZE_LEN + STATUS_LEN + len(YELLOW) + len(END) + 6)
         if not instance_in_ceph(instance):
-            l = '{:^%s}' % (DATE_LEN + TYPE_LEN + SIZE_LEN + STATUS_LEN + len(YELLOW) + len(END) + 6)
             print(d.join(("", p(INSTANCE_LEN, instance.name), p(TENANT_LEN, tenant), \
-                    l.format(YELLOW + "--==( Nothing to backup )==--" + END ), "")))
+                    l.format(YELLOW + "-- Nothing to backup --" + END ), "")))
         else:
-            print(d.join(("", p(INSTANCE_LEN, instance.name), p(TENANT_LEN, tenant), p(DATE_LEN, ""), \
-                    p(DATE_LEN, ""), p(TYPE_LEN, ""), p(STATUS_LEN, ""), "")))
-
+            print(d.join(("", p(INSTANCE_LEN, instance.name), p(TENANT_LEN, tenant), \
+                    l.format(RED + "-- No backups found --" + END ), "")))
 
 def instance_in_ceph(instance):
     if instance.metadata.get('storage')=='rbd:ceph/vms':
@@ -837,11 +881,11 @@ for instance in sorted(INSTANCE_LIST, key=lambda f: f.tenant_id):
             # volumes attached or with root disk not in Ceph have nothing to backup
             LOG.warning("Nothing to backup for instance %s" % instance.name)
             continue
-        for rbd_img in rbd_list:
-            if is_clone(rbd_img):
-                LOG.info("Flattening RBD image %s/%s" % \
-                        (detect_pool(rbd_img.name), rbd_img.name))
-                rbd_img.flatten()
+        #for rbd_img in rbd_list:
+        #    if is_clone(rbd_img):
+        #        LOG.info("Flattening RBD image %s/%s" % \
+        #                (detect_pool(rbd_img.name), rbd_img.name))
+        #        rbd_img.flatten()
         if BACKUP_TYPE=='full':
             instance_backup(instance, dom, rbd_list, full_backup=True)
         elif BACKUP_TYPE=='inc':
