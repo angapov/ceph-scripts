@@ -344,6 +344,10 @@ def ensure_dir(dir):
     if not os.path.exists(dir):
         os.makedirs(dir)
 
+def backup_folder(instance):
+    folder = instance.name.replace(" ", "_").replace("/", "") + "_" + instance.id
+    return "/".join((BACKUPS_TOP_DIR, folder))
+
 def remove_empty_subdirs(directory):
     for root, dirs, files in os.walk(directory):
         for dir in dirs:
@@ -358,18 +362,17 @@ def export_diff(instance, rbd_list, full_backup=False):
     res = 0
     dest_dir = None
     curr_time = current_time()
-    instance_name = instance.name.replace(" ", "_").replace("/", "")
     for rbd_image in rbd_list:
         snaps_list = snapshots_list(rbd_image)
         if not snaps_list:
             LOG.error("No proper snapshots found for image %s ! Backup is not possible!" % rbd_image.name)
-            dest_dir = "/".join((BACKUPS_TOP_DIR, instance_name + "_" + instance.id, curr_time))
+            dest_dir = "/".join((backup_folder(instance), curr_time))
             ensure_dir(dest_dir)
             res += 1
             continue
         snap = snaps_list[-1]
         pool = detect_pool(rbd_image.name)
-        dest_dir = "/".join((BACKUPS_TOP_DIR, instance_name + "_" + instance.id, snap))
+        dest_dir = "/".join((backup_folder(instance), snap))
         ensure_dir(dest_dir)
         if full_backup:
             LOG.info("Export RBD image %s" % rbd_image.name)
@@ -379,7 +382,7 @@ def export_diff(instance, rbd_list, full_backup=False):
         else:
             if len(snaps_list)==1:
                 LOG.error("Only one snapshot found for image %s ! Incremental backup is not possible!" % rbd_image.name)
-                dest_dir = "/".join((BACKUPS_TOP_DIR, instance_name + "_" + instance.id, curr_time))
+                dest_dir = "/".join((backup_folder(instance), curr_time))
                 ensure_dir(dest_dir)
                 res += 1
                 continue
@@ -416,7 +419,7 @@ def export_diff(instance, rbd_list, full_backup=False):
         status_file = os.path.join(dest_dir, 'status')
         with open(status_file, "w+") as f:
             f.write(str(res) + '\n')
-    remove_empty_subdirs("/".join((BACKUPS_TOP_DIR, instance_name + "_" + instance.id)))
+    remove_empty_subdirs(backup_folder(instance))
     if full_backup and res == 0:
         backups = get_backups(instance)
         full_backup_dates = [d for d in sorted(backups.keys()) if backups[d].get('type') == 'full']
@@ -474,12 +477,12 @@ def instance_backup(instance, dom, rbd_list, full_backup=False):
 def restore_instance_inplace(instance, dest_date):
     LOG.info("Performing inplace restore of instance %s to date %s" % (instance.name, dest_date))
     if instance_is_running(instance):
-        LOG.info("Powering off instance...")
+        LOG.info("Powering off instance.", end="")
         instance.stop()
         while instance_is_running(instance):
             print('.', end='')
             sleep(2)
-        print(" Done")
+        print("\nDone")
     else:
         LOG.info("Instance is already powered off")
     root_rbd_id = str(instance.id + "_disk")
@@ -525,8 +528,7 @@ def restore_instance_inplace(instance, dest_date):
 
 def get_backups(instance):
     backups = {}
-    instance_name = instance.name.replace(" ", "_").replace("/", "")
-    backup_dir = "/".join((BACKUPS_TOP_DIR, instance_name + "_" + instance.id))
+    backup_dir = backup_folder(instance)
     if os.path.exists(backup_dir):
         dates = [dir for dir in os.listdir(backup_dir) if os.path.isdir(os.path.join(backup_dir, dir))]
         for date in dates:
@@ -554,7 +556,7 @@ def get_backups(instance):
     return backups
 
 def backup_is_available(instance, date, rbd_name):
-    backup_dir = "/".join((BACKUPS_TOP_DIR, instance.name + "_" + instance.id, date))
+    backup_dir = "/".join((backup_folder(instance), date))
     if not os.path.isdir(backup_dir) or not os.listdir(backup_dir):
         return False
     if any([rbd_name in file for file in os.listdir(backup_dir)]):
@@ -593,9 +595,8 @@ def display_backups(instance):
                 p(TYPE_LEN, backup_type), p(SIZE_LEN, str(size)), p(STATUS_LEN+9, status), "")))
     bs = get_backups(instance)
     tenant = get_tenant_name_by_id(instance.tenant_id, instance.id)
-    instance_name = instance.name.replace(" ", "_").replace("/", "")
     if bs:
-        backup_dir = "/".join((BACKUPS_TOP_DIR, instance_name + "_" + instance.id))
+        backup_dir = backup_folder(instance)
         for i, b in enumerate(sorted(bs.keys())):
             size = float(0)
             files = bs[b].get('files')
